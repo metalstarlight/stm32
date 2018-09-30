@@ -60,8 +60,8 @@
 // ЭФФЕКТЫ
 #define PIXEL_AMOUNT 300 // число "живых" пикселей
 
-#define MATR_X_M MATR_X * PIXELSIZE // размер матрицы в миллиметрах х
-#define MATR_Y_M MATR_Y * PIXELSIZE // размер матрицы в миллиметрах у
+#define MATR_X_M MATR_X*PIXELSIZE // размер матрицы в миллиметрах х
+#define MATR_Y_M MATR_Y*PIXELSIZE // размер матрицы в миллиметрах у
 #define oyMAX 10000
 #define oyMIN 9000
 
