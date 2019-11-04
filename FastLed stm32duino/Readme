@@ -1,1 +1,1 @@
-Copy this files to Arduino\libraries\FastLED\platforms\arm\stm32\
+Copy files from this directory into "..\Arduino\libraries\FastLED\platforms\arm\stm32\"
