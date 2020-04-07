@@ -9,9 +9,10 @@
 //#include "LiquidCrystal_I2C.h"
 #include <LCD_1602_RUS_ALL.h> // вместо I2C библиотеки - в рус.версии уже прописано всё.
 #include "LiquidMenu.h"
-#include "NTC_Thermistor.h"
+//#include "NTC_Thermistor.h"
 #include <GyverFilters.h>
-
+//#include "ds18x20.h"
+#include "OneWireSTM.h"
 //------------НАСТРОЙКИ------------
 //Термосопротивление
 #define SENSOR_PIN PB1               // Пин сенсора по схеме: (+)---NTC---(Ain)---Rreference---(-)
@@ -26,7 +27,7 @@
 #define SOLID_RELAY_HEATER_PIN PB15 // Пин твердотельного реле на нагреватель
 #define RELAY_PUMP_PIN PA8          // Пин реле на помпу
 #define RELAY_RESERVED PA9
-#define INVERSED_PUMP_LOGIC 1
+#define INVERSED_PUMP_LOGIC 1 // Флаг инверсии логики помпы. 1 - инвертировано, 0 - неинвертировано.
 
 #define MAX_ZATIR_MODES 6   // Количество ступеней затирки
 #define MAX_WARKA_ZABROSY 6 // Количество ступеней варки-закидывания хмеля
@@ -88,11 +89,18 @@ void warkaPumpWorkTimeIncrease();
 void warkaPumpWorkTimeDecrease();
 void warkaPumpStopTimeIncrease();
 void warkaPumpStopTimeDecrease();
+uint32_t returnSetpointTemperaStupeniWarki();
+float timeUntilEndOfWarka();
 const char *isPumpRunning();
 float timeUntilEndOfStageWarka();
 uint32_t timeSinceStartOfModeFunc();
 void stopKran();
-
+void koeff_Regulator_Increase();
+void koeff_Regulator_Decrease();
+void hysterezis_Regulator_Increase();
+void hysterezis_Regulator_Decrease();
+void initTemperSensor();
+void temperMeasure();
 void ISRenc();
 void blankFunction()
 {
@@ -100,6 +108,10 @@ void blankFunction()
 }
 
 //-----------Переменные------------
+byte present = 0;
+byte type_s;
+byte data[12];
+byte addr[8];
 
 typedef enum
 {
@@ -108,14 +120,14 @@ typedef enum
   WARKA
 } stationModes; // 0 - выкл, 1 - затирание, 2 - варка
 
-static bool isFirstRun = 1,
-            isZatirkaRunning = 0,
-            isWarkaRunning = 0;
-
+bool isFirstRun = 1,
+     isZatirkaRunning = 0,
+     isWarkaRunning = 0,
+     flagTemperDostignuta = 0;
 stationModes stationCurrentMode = OFF; // User должен выбрать режим работы вручную
 static uint32_t timeVarMs,             // Счётчик для логики
     timeSinceStartOfMode;              // Счётчик от начала процесса
-static float filteredTemperature = 0; // Переменная в которую положим отфильтрованную температуру
+static float filteredTemperature = 0;  // Переменная в которую положим отфильтрованную температуру
 struct Pump
 {
   uint32_t timeInWorkMsWarka, // Время работы при варке
@@ -144,17 +156,21 @@ uint32_t hmelZabrosTimeMsSinceStart[MAX_WARKA_ZABROSY]{}; // Массив заб
 //-----------
 
 //------------Создание объектов---------
-Thermistor *thermistor;
+//Thermistor *thermistor;
+//DS18x20Serial thermosensor(2); //num USART for DS18x20 (PA2 - tx, PA3 - rx)
+OneWire thermosensor(PA2);
 GyverRelay regulator(REVERSE_RELAY);
-Encoder encoder(PB13, PB12, PB14, 1);                             //
-GKalman filterKalman(14, 0.01);                                   //  Настройка фильтра
-LCD_1602_RUS<LiquidCrystal_I2C> lcd(0x27, 20, 4);                 // set the LCD address to 0x27 for a 20 chars and 4 line display
-                                                                  //  //-------Добавление строк меню
-LiquidLine MainMenuLine1(0, 0, "Ustanovki zatirki");              // Настр.затирки                    //
-LiquidLine MainMenuLine2(0, 0, "START zatirki");                  //     СТАРТ Затирки                 //
-LiquidLine MainMenuLine3(0, 0, "Ustanovki warki");                //Настройки варки                              //
-LiquidLine MainMenuLine4(0, 0, "START warki");                    //СТАРТ Варки                            //
-LiquidLine MainMenuLine5(0, 0, "Temper:", returnTemperInCelsius); //ТемпДатчика:  // Тут считает напрямую, функция не нужна
+Encoder encoder(PB13, PB12, PB14, 1);                                  //
+GKalman filterKalman(14, 0.01);                                        //  Настройка фильтра
+LCD_1602_RUS<LiquidCrystal_I2C> lcd(0x27, 20, 4);                      // set the LCD address to 0x27 for a 20 chars and 4 line display
+                                                                       //  //-------Добавление строк меню
+LiquidLine MainMenuLine1(0, 0, "Ustanovki zatirki");                   // Настр.затирки                    //
+LiquidLine MainMenuLine2(0, 0, "START zatirki");                       //     СТАРТ Затирки                 //
+LiquidLine MainMenuLine3(0, 0, "Ustanovki warki");                     //Настройки варки                              //
+LiquidLine MainMenuLine4(0, 0, "START warki");                         //СТАРТ Варки                            //
+LiquidLine MainMenuLine5(0, 0, "Temper:", returnTemperInCelsius);      //ТемпДатчика:  // Тут считает напрямую, функция не нужна
+LiquidLine MainMenuLine6(0, 0, "k coeff = ", regulator.k);             // коэффициент k регулятора
+LiquidLine MainMenuLine7(0, 0, "hysterezis = ", regulator.hysteresis); //Дельта гистерезиса регулятора
 
 LiquidLine ZatirkaSettingsLine1(0, 0, "-Ustanovki  zatirki-");                   // Настр.затирки
 LiquidLine ZatirkaSettingsLine2(0, 0, "Stupien #", returnNumerStupieniZatirka);  //Ступень #
@@ -174,19 +190,21 @@ LiquidLine WarkaSettingsLine7(0, 0, "Pump stop time:", warkaPumpStopTime);  //У
 LiquidLine WarkaSettingsLine8(0, 0, "BACK");
 
 LiquidLine runWarkaLine1(0, 0, warkaStatus);
-LiquidLine runWarkaLine2(0, 0, "Numer zabrosa:", returnNumerZabrosaWarka);   // Ном. заброса:
-LiquidLine runWarkaLine3(0, 0, "Curr.temper:", returnTemperInCelsius);       // Тек. Темпер =
-LiquidLine runWarkaLine4(0, 0, "Do zabrosa:", timeUntilEndOfStageWarka);     // До конца ступени:
-LiquidLine runWarkaLine5(0, 0, "Min od zapuska:", timeSinceStartOfModeFunc); //Мин. от запуска
-LiquidLine runWarkaLine6(0, 0, "Pump state:", isPumpRunning);
-LiquidLine runWarkaLine7(0, 0, "CTOn-KPAH");
-LiquidLine runWarkaLine8(0, 0, "BACK");
+LiquidLine runWarkaLine2(0, 0, "Numer zabrosa:", returnNumerZabrosaWarka);             // Ном. заброса:
+LiquidLine runWarkaLine3(0, 0, "Curr.temper:", returnTemperInCelsius);                 // Тек. Темпер =
+LiquidLine runWarkaLine4(0, 0, "Setpoint temper:", returnSetpointTemperaStupeniWarki); // Сетпоинт варки
+LiquidLine runWarkaLine5(0, 0, "Do zabrosa:", timeUntilEndOfStageWarka);               // До конца ступени:
+LiquidLine runWarkaLine6(0, 0, "Min od zapuska:", timeSinceStartOfModeFunc);           //Мин. от запуска
+LiquidLine runWarkaLine7(0, 0, "Min do konca:", timeUntilEndOfWarka);                  //Мин. до конца
+LiquidLine runWarkaLine8(0, 0, "Pump state:", isPumpRunning);                          // Состояние насоса
+LiquidLine runWarkaLine9(0, 0, "CTOn-KPAH");                                           // Стоп-кран
+LiquidLine runWarkaLine10(0, 0, "BACK");
 
 LiquidLine runZatirkaLine1(0, 0, zatirkaStatus);
-LiquidLine runZatirkaLine2(0, 0, "Num.stupeni:", returnNumerStupeniZatirki);           //Ном.ступени:
-LiquidLine runZatirkaLine3(0, 0, "Curr.temper:", returnTemperInCelsius);               //Темпер =
-LiquidLine runZatirkaLine4(0, 0, "t. Setpoint:", returnSetpointTemperaStupeniZatirka); //До конца:
-LiquidLine runZatirkaLine5(0, 0, "Do konca:", timeUntilEndOfZatirka);                  //До конца:
+LiquidLine runZatirkaLine2(0, 0, "Num.stupeni:", returnNumerStupeniZatirki);               //Ном.ступени:
+LiquidLine runZatirkaLine3(0, 0, "Curr.temper:", returnTemperInCelsius);                   //Темпер =
+LiquidLine runZatirkaLine4(0, 0, "Setpoint temper:", returnSetpointTemperaStupeniZatirka); //Сетпоинт
+LiquidLine runZatirkaLine5(0, 0, "Do konca:", timeUntilEndOfZatirka);                      //До конца:
 LiquidLine runZatirkaLine6(0, 0, "Pump state:", isPumpRunning);
 LiquidLine runZatirkaLine7(0, 0, "CTOn-KPAH");
 LiquidLine runZatirkaLine8(0, 0, "BACK");
@@ -194,11 +212,6 @@ LiquidLine runZatirkaLine8(0, 0, "BACK");
 LiquidScreen screenMainMenu, screenSettingsZatirka, screenSettingsWarka, screenRunZatirka, screenRunWarka;
 
 LiquidMenu mainMenu(lcd);
-// LiquidMenu menuSettings(lcd);
-// LiquidMenu menuRun(lcd);
-
-//  //
-//-------------Encoder прикрутить
 
 void setup() // ############## УСТАНОВКИ ##############
 {
@@ -223,7 +236,6 @@ void initStation() //
   pinMode(RELAY_PUMP_PIN, OUTPUT);
   pinMode(SOLID_RELAY_HEATER_PIN, OUTPUT);
   pinMode(RELAY_RESERVED, OUTPUT);
-  Serial.begin(9600);
   //****************************************
   // Останов всех устройств
   //****************************************
@@ -234,21 +246,26 @@ void initStation() //
 
   // LCD, NTC, Keypad, memoryRead
   encoder.setDirection(NORM);
+  initTemperSensor();
+
   // A thermistor instance creating
-  thermistor = new NTC_Thermistor(
-      SENSOR_PIN,
-      REFERENCE_RESISTANCE,
-      NOMINAL_RESISTANCE,
-      NOMINAL_TEMPERATURE,
-      B_VALUE,
-      STM32_ANALOG_RESOLUTION // <- for a thermistor calibration
-  );
+  Serial.begin(9600);
+  //thermosensor.DS18x20SerialInit();
+  // thermistor = new NTC_Thermistor(
+  //     SENSOR_PIN,
+  //     REFERENCE_RESISTANCE,
+  //     NOMINAL_RESISTANCE,
+  //     NOMINAL_TEMPERATURE,
+  //     B_VALUE,
+  //     STM32_ANALOG_RESOLUTION // <- for a thermistor calibration
+  // );
   //****************************************
-  // НАСТРОЙКА РЕГУЛЯТОРА ГУВЕРА - коэффициенты подбирать!!!!
+  // @note НАСТРОЙКА РЕГУЛЯТОРА ГУВЕРА - коэффициенты подбирать!!!!
   //****************************************
   regulator.setpoint = 0; // Default
   regulator.hysteresis = 4;
-  regulator.k = 50; // Нужно подгонять в случае неправильной работы регулятора (было 0.5)
+  regulator.k = 200; // Нужно подгонять в случае неправильной работы регулятора (было 0.5)
+  regulator.dT = 200;
   //****************************************
   //  Настраиваем Таймер2 для организации прерываний
   //****************************************
@@ -281,6 +298,8 @@ void initLCDmenu()
   screenMainMenu.add_line(MainMenuLine3);
   screenMainMenu.add_line(MainMenuLine4);
   screenMainMenu.add_line(MainMenuLine5);
+  screenMainMenu.add_line(MainMenuLine6);
+  screenMainMenu.add_line(MainMenuLine7);
 
   screenSettingsZatirka.add_line(ZatirkaSettingsLine1);
   screenSettingsZatirka.add_line(ZatirkaSettingsLine2);
@@ -307,6 +326,8 @@ void initLCDmenu()
   screenRunWarka.add_line(runWarkaLine6);
   screenRunWarka.add_line(runWarkaLine7);
   screenRunWarka.add_line(runWarkaLine8);
+  screenRunWarka.add_line(runWarkaLine9);
+  screenRunWarka.add_line(runWarkaLine10);
 
   screenRunZatirka.add_line(runZatirkaLine1);
   screenRunZatirka.add_line(runZatirkaLine2);
@@ -322,7 +343,11 @@ void initLCDmenu()
   MainMenuLine2.attach_function(3, startZatirkiMenuOnCheck);        // Если выбираем долгим нажатием строку - запуск функции
   MainMenuLine3.attach_function(3, funcSettingsWarkaMenuOnCheck);
   MainMenuLine4.attach_function(3, startWarkiMenuOnCheck);
-  MainMenuLine5.attach_function(1, blankFunction); // Оставить так для возможности перемещения по меню
+  MainMenuLine5.attach_function(1, blankFunction);                 // Оставить так для возможности перемещения по меню
+  MainMenuLine6.attach_function(1, koeff_Regulator_Increase);      // Коэффициент +
+  MainMenuLine6.attach_function(2, koeff_Regulator_Decrease);      // Коэффициент -
+  MainMenuLine7.attach_function(1, hysterezis_Regulator_Increase); // Гистерезис +
+  MainMenuLine7.attach_function(2, hysterezis_Regulator_Decrease); // Гистерезис -
 
   //ZatirkaSettingsLine1.attach_function(1, blankFunction);                  //  "Настройки затирки");
   ZatirkaSettingsLine2.attach_function(1, zatirkaStupienSelectorIncrease); //"Ступень #" +1,
@@ -353,13 +378,15 @@ void initLCDmenu()
   WarkaSettingsLine8.attach_function(3, backToMainMenu);              //"ВЗАД"
 
   //runWarkaLine1.attach_function(1, blankFunction);  //ПРОЦЕСС ВАРКИ
-  runWarkaLine2.attach_function(1, blankFunction);  //"Ном. заброса: "
-  runWarkaLine3.attach_function(1, blankFunction);  //"Темпер = "
-  runWarkaLine4.attach_function(1, blankFunction);  //"До конца ступени:"
-  runWarkaLine5.attach_function(1, blankFunction);  //"Мин. от начала работы:"
-  runWarkaLine6.attach_function(1, blankFunction);  //Помпа работает?
-  runWarkaLine7.attach_function(3, stopKran);       //"СТОП-КРАН"
-  runWarkaLine8.attach_function(3, backToMainMenu); //"ВЗАД"
+  runWarkaLine2.attach_function(1, blankFunction);   //"Ном. заброса: "
+  runWarkaLine3.attach_function(1, blankFunction);   //"Темпер = "
+  runWarkaLine4.attach_function(1, blankFunction);   // Сетпоинт варки
+  runWarkaLine5.attach_function(1, blankFunction);   // До заброса
+  runWarkaLine6.attach_function(1, blankFunction);   //От запуска
+  runWarkaLine7.attach_function(1, blankFunction);   //"До конца ступени:"
+  runWarkaLine8.attach_function(1, blankFunction);   //Помпа работает?
+  runWarkaLine9.attach_function(3, stopKran);        //"СТОП-КРАН"
+  runWarkaLine10.attach_function(3, backToMainMenu); //"ВЗАД"
 
   //runZatirkaLine1.attach_function(1, blankFunction);  //ПРОЦЕСС ЗАТИРКИ
   runZatirkaLine2.attach_function(1, blankFunction);  //"Ном.ступени:"
@@ -384,6 +411,8 @@ void initLCDmenu()
 
   // // Set the number of decimal places for a "line".
   MainMenuLine5.set_decimalPlaces(3);
+  MainMenuLine6.set_decimalPlaces(2);
+  MainMenuLine7.set_decimalPlaces(2);
   runZatirkaLine4.set_decimalPlaces(1);
   runWarkaLine4.set_decimalPlaces(1);
   runWarkaLine5.set_decimalPlaces(1);
@@ -408,8 +437,8 @@ void runStation()
   // Режим работы помпы для обоих режимов станции, время работы и время отдыха.
   // Также добавить функцию сброса всех переменных предыдущего процесса при смене юзером режима работы (затирка/варка)
 
-  filteredTemperature = filterKalman.filtered(thermistor->readCelsius()); // Сначала прочитаем температуру и отфильтруем значение фильтром Калмана
-
+  //filteredTemperature = filterKalman.filtered(thermosensor.tt); // Сначала прочитаем температуру и отфильтруем значение фильтром Калмана
+  temperMeasure();
   userIO();
   switch (stationCurrentMode) //         СОСТОЯНИЕ СТАНЦИИ
   {
@@ -463,6 +492,7 @@ void userIO() // Логика взаимодействия с юзером, ин
 
 void zatiranie()
 {
+
   if (waitForNextZatMode())
   {
     if (zatModes[numZatMode].durationTimeMs == 0 || (numZatMode > MAX_ZATIR_MODES - 1)) // Если следующего режима затирки нет
@@ -491,78 +521,121 @@ void zatiranie()
   }
 }
 
-void warka() // Логика работы помпы
+void warka() // @note Логика работы помпы
 {
-  if (warkaDurationTimeMs > 0)
+  if (filteredTemperature < (warkaSetpointTemperature - 0.5) && !flagTemperDostignuta) // Пока температура не достигнута
   {
-    runPumpWarka(pump.runFlag); // Запускаем систему до тех пор пока время работы варки не вышло
+    isWarkaRunning = 1;
+    timeVarMs = millis();
+    timeSinceStartOfMode = millis();
+    runPumpWarka(pump.runFlag);
     regulator.setpoint = warkaSetpointTemperature;
     regulator.input = filteredTemperature;
-    
-    digitalWrite(SOLID_RELAY_HEATER_PIN, regulator.getResultTimer());
-
-    if (hmelZabrosTimeMsSinceStart[numVarZabros] > 0 && !(numVarZabros > MAX_WARKA_ZABROSY - 1))
-    {                            //Существует ли текущий заброс?
-      isTimeForNextHmel_Warka(); /* Проверка пришло ли время заброса? */
-    }
+    digitalWrite(SOLID_RELAY_HEATER_PIN, regulator.getResultTimer()); // отправляем на реле (ОС работает по своему таймеру)
+    return;
   }
-  else
+
+  if (filteredTemperature >= warkaSetpointTemperature - 0.5)
   {
-    isWarkaRunning = 0;
-    regulator.output = 0;
-    digitalWrite(SOLID_RELAY_HEATER_PIN, 0);
-    stationCurrentMode = OFF;
-    runPumpWarka(pump.stopFlag);
-    //pumpModeFlag = 0;
-    numVarZabros = 0;
-    isFirstRun = 1;
-    for (int i = 0; i < 5; i++) // Сигнал об окончании варки
+    flagTemperDostignuta = 1;
+  }
+
+  if (flagTemperDostignuta)
+  {
+    if (isFirstRun && !isWarkaRunning) // Первый пробег
     {
-      tone(ALARM_PIN, 660, 500);
-      delay(300);
-      tone(ALARM_PIN, 770, 500);
-      delay(300);
+      timeVarMs = millis(); // Сбросим таймер чтобы отсчёт до следующего таймаута начинался с нуля корректно.
+      isWarkaRunning = 1;
+      isFirstRun = 0;
+      regulator.setpoint = warkaSetpointTemperature;
+    }
+
+    if ((millis() - timeVarMs) < (warkaDurationTimeMs))
+    {
+      runPumpWarka(pump.runFlag); // Запускаем систему до тех пор пока время работы варки не вышло
+      regulator.input = filteredTemperature;
+      digitalWrite(SOLID_RELAY_HEATER_PIN, regulator.getResultTimer());
+      if (hmelZabrosTimeMsSinceStart[numVarZabros] > 0 && !(numVarZabros > MAX_WARKA_ZABROSY - 1))
+      {                            //Существует ли текущий заброс?
+        isTimeForNextHmel_Warka(); /* Проверка пришло ли время заброса? */
+      }
+    }
+    else
+    {
+      isWarkaRunning = 0;
+      regulator.output = 0;
+      digitalWrite(SOLID_RELAY_HEATER_PIN, 0);
+      stationCurrentMode = OFF;
+      runPumpWarka(pump.stopFlag);
+      //pumpModeFlag = 0;
+      numVarZabros = 0;
+      isFirstRun = 1;
+      flagTemperDostignuta = 0;
+      for (int i = 0; i < 5; i++) // Сигнал об окончании варки
+      {
+        tone(ALARM_PIN, 660, 500);
+        delay(300);
+        tone(ALARM_PIN, 1000, 500);
+        delay(300);
+      }
     }
   }
 }
 
-bool waitForNextZatMode() // Ожидание следующего режима затирки
+bool waitForNextZatMode() // @note Ожидание следующего режима затирки
 {
-
-  if (isFirstRun && !isZatirkaRunning) // Первый пробег
+  if (filteredTemperature < (zatModes[numZatMode].temperature - 0.5) && !flagTemperDostignuta) // Пока температура не достигнута
   {
-    timeVarMs = millis(); // Сбросим таймер чтобы отсчёт до следующего таймаута начинался с нуля корректно.
     isZatirkaRunning = 1;
-    isFirstRun = 0;
+    timeVarMs = millis();
+    runPumpZatirka(pump.runFlag);
     regulator.setpoint = zatModes[numZatMode].temperature;
+    regulator.input = filteredTemperature;
+    digitalWrite(SOLID_RELAY_HEATER_PIN, regulator.getResultTimer()); // отправляем на реле (ОС работает по своему таймеру)
   }
-  runPumpZatirka(pump.runFlag);
-  regulator.input = filteredTemperature; 
-  digitalWrite(SOLID_RELAY_HEATER_PIN, regulator.getResultTimer()); // отправляем на реле (ОС работает по своему таймеру)
-
-  if (((millis() - timeVarMs) > (zatModes[numZatMode].durationTimeMs)) && isZatirkaRunning) // Время вышло - переходим на следующую ступень
+  if (filteredTemperature > zatModes[numZatMode].temperature - 0.5)
   {
-    isFirstRun = 1;
-    isZatirkaRunning = 0;
-    numZatMode++;
+    flagTemperDostignuta = 1;
+  }
 
-    // for (uint32_t i = 0; i < 1; i++)
-    // {
-    tone(ALARM_PIN, 660, 100);
-    delay(150);
-    tone(ALARM_PIN, 660, 100);
-    delay(300);
-    tone(ALARM_PIN, 660, 100);
-    delay(300);
-    tone(ALARM_PIN, 510, 100);
-    delay(100);
-    tone(ALARM_PIN, 660, 100);
-    delay(300);
-    tone(ALARM_PIN, 770, 100);
-    delay(550);
-    tone(ALARM_PIN, 380, 100);
-    //}
-    return 1;
+  if (flagTemperDostignuta)
+  {
+    if (isFirstRun && !isZatirkaRunning) // Первый пробег
+    {
+      timeVarMs = millis(); // Сбросим таймер чтобы отсчёт до следующего таймаута начинался с нуля корректно.
+      isZatirkaRunning = 1;
+      isFirstRun = 0;
+      regulator.setpoint = zatModes[numZatMode].temperature;
+    }
+    runPumpZatirka(pump.runFlag);
+    regulator.input = filteredTemperature;
+    digitalWrite(SOLID_RELAY_HEATER_PIN, regulator.getResultTimer()); // отправляем на реле (ОС работает по своему таймеру)
+
+    if (((millis() - timeVarMs) > (zatModes[numZatMode].durationTimeMs)) && isZatirkaRunning) // Время вышло - переходим на следующую ступень
+    {
+      isFirstRun = 1;
+      isZatirkaRunning = 0;
+      numZatMode++;
+      flagTemperDostignuta = 0;
+
+      // for (uint32_t i = 0; i < 1; i++)
+      // {
+      tone(ALARM_PIN, 660, 100);
+      delay(150);
+      tone(ALARM_PIN, 660, 100);
+      delay(300);
+      tone(ALARM_PIN, 660, 100);
+      delay(300);
+      tone(ALARM_PIN, 510, 100);
+      delay(100);
+      tone(ALARM_PIN, 660, 100);
+      delay(300);
+      tone(ALARM_PIN, 770, 100);
+      delay(550);
+      tone(ALARM_PIN, 380, 100);
+      //}
+      return 1;
+    }
   }
   return 0;
 }
@@ -720,6 +793,11 @@ void startZatirkiMenuOnCheck()
     stationCurrentMode = ZATIRANIE;
     numZatMode = 0;
     pump.dominantFlag = 1;
+    flagTemperDostignuta = 0;
+    // EEPROM.put(EEPROM_Address_To_Write, regulator.k);
+    // EEPROM_Address_To_Write += sizeof(float);
+    // EEPROM.put(EEPROM_Address_To_Write, regulator.hysteresis);
+
     timeSinceStartOfMode = millis();
     mainMenu.change_screen(5); //Переключиться на экран меню процесса затирки
     mainMenu.set_focusedLine(1);
@@ -750,10 +828,10 @@ void startWarkiMenuOnCheck()
     delay(200);
     tone(ALARM_PIN, 300, 300);
     numVarZabros = 0;
-    isWarkaRunning = 1;
     stationCurrentMode = WARKA;
     pump.dominantFlag = 1;
     timeSinceStartOfMode = millis();
+    flagTemperDostignuta = 0;
     mainMenu.change_screen(4); //Переключиться на экран меню процесса варки
     mainMenu.set_focusedLine(1);
     mainMenu.update();
@@ -1027,6 +1105,25 @@ void stopKran()
   tone(ALARM_PIN, 500, 3000);
 }
 
+float timeUntilEndOfWarka()
+{ //Время до конца текущей ступени затирки
+  if (!isWarkaRunning)
+  {
+    return 0;
+  }
+
+  float varWhichIsReturning = (float)((timeVarMs + warkaDurationTimeMs) - millis()) / (60 * 1000);
+  if (varWhichIsReturning < 600)
+    return varWhichIsReturning;
+  else
+    return 0;
+}
+
+uint32_t returnSetpointTemperaStupeniWarki()
+{
+  return warkaSetpointTemperature;
+}
+
 #pragma endregion runWarka
 
 #pragma region runZatirka // Меню процесса затирки (меню номер 5)
@@ -1058,4 +1155,126 @@ uint32_t returnSetpointTemperaStupeniZatirka()
 
 #pragma endregion runZatirka
 
+//*****************************
+// @remind Сервисные функции настройки регулятора
+//*****************************
 
+void koeff_Regulator_Increase()
+{
+  if (regulator.k >= 1 && regulator.k <= 499)
+    regulator.k++;
+  if (regulator.k < 1)
+    regulator.k += 0.1;
+}
+
+void koeff_Regulator_Decrease()
+{
+  if (regulator.k > 1)
+    regulator.k--;
+  if (regulator.k > 0 && regulator.k <= 1)
+    regulator.k -= 0.1;
+  if (regulator.k == 0)
+    return;
+}
+
+void hysterezis_Regulator_Increase()
+{
+  if (regulator.hysteresis >= 1 && regulator.hysteresis <= 20)
+    regulator.hysteresis++;
+  if (regulator.hysteresis <= 1)
+    regulator.hysteresis += 0.1;
+}
+
+void hysterezis_Regulator_Decrease()
+{
+  if (regulator.hysteresis > 1)
+    regulator.hysteresis--;
+  if (regulator.hysteresis > 0 && regulator.hysteresis <= 1)
+    regulator.hysteresis -= 0.1;
+  if (regulator.hysteresis == 0)
+    return;
+}
+
+void initTemperSensor()
+{
+
+  if (!thermosensor.search(addr))
+  {
+    thermosensor.reset_search();
+    delay(250);
+    return;
+  }
+
+  // the first ROM byte indicates which chip
+  switch (addr[0])
+  {
+  case 0x10:
+    Serial.println("  Chip = DS18S20"); // or old DS1820
+    type_s = 1;
+    break;
+  case 0x28:
+    Serial.println("  Chip = DS18B20");
+    type_s = 0;
+    break;
+  case 0x22:
+    Serial.println("  Chip = DS1822");
+    type_s = 0;
+    break;
+  default:
+    Serial.println("Device is not a DS18x20 family device.");
+    return;
+  }
+}
+
+void temperMeasure()
+{
+  static uint32_t timeOut = millis();
+
+  if (millis() - timeOut > 1000)
+  {
+
+    thermosensor.reset();
+    thermosensor.select(addr);
+    thermosensor.write(0x44, 1); // start conversion, with parasite power on at the end
+
+    // we might do a ds.depower() here, but the reset will take care of it.
+
+    present = thermosensor.reset();
+    thermosensor.select(addr);
+    thermosensor.write(0xBE); // Read Scratchpad
+
+    for (uint32_t i = 0; i < 9; i++)
+    { // we need 9 bytes
+      data[i] = thermosensor.read();
+    }
+
+    // Convert the data to actual temperature
+    // because the result is a 16 bit signed integer, it should
+    // be stored to an "int16_t" type, which is always 16 bits
+    // even when compiled on a 32 bit processor.
+    int16_t raw = (data[1] << 8) | data[0];
+    if (type_s)
+    {
+      raw = raw << 3; // 9 bit resolution default
+      if (data[7] == 0x10)
+      {
+        // "count remain" gives full 12 bit resolution
+        raw = (raw & 0xFFF0) + 12 - data[6];
+      }
+    }
+    else
+    {
+      byte cfg = (data[4] & 0x60);
+      // at lower res, the low bits are undefined, so let's zero them
+      if (cfg == 0x00)
+        raw = raw & ~7; // 9 bit resolution, 93.75 ms
+      else if (cfg == 0x20)
+        raw = raw & ~3; // 10 bit res, 187.5 ms
+      else if (cfg == 0x40)
+        raw = raw & ~1; // 11 bit res, 375 ms
+      //// default is 12 bit resolution, 750 ms conversion time
+    }
+    filteredTemperature = (float)raw / 16.0;
+    timeOut = millis();
+  }
+}
